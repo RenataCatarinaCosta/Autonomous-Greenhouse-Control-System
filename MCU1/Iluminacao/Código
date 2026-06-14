@@ -8,8 +8,8 @@
 BH1750 lightMeter;
 
 // LIGAÇÃO WIFI
-const char* ssid = "Vodafone-2C9BF9";
-const char* password = "g4n8tUuuh2";
+const char* ssid = "";
+const char* password = "";
 
 //THINGSPEAK - ILUMINAÇÃO
 const String apiKey = "FCLWKMOHAF15WMZF";
