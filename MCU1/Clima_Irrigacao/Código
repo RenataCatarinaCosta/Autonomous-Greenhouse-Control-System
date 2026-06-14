@@ -1,1 +1,868 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_BME280.h>
+#include <U8g2lib.h>
+
+Adafruit_BME280 BME280;
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);            //Defenido de acordo com a biblioteca
+
+// Conexão WIFI
+const char* ssid = "Vodafone-2C9BF9";                                       //Rede de WIFI 
+const char* password = "g4n8tUuuh2";
+const String server = "http://api.thingspeak.com/update";
+const String apiKeyClima = "A6OLVZE0BCZXE2ZM";                              //Chaves do canal de cada variável
+const String apiKeyIrriga = "KF8CCMF1RTLW9CEI";
+
+//  Definição dos pinos LORA
+#define LORA_SS   18                                                        //Defenidos de acordo com o sistema do ESP32 LILY GO
+#define LORA_RST  23
+#define LORA_DIO0 26
+
+// Defenição dos Restantes pinos
+#define FAN_PIN    13
+#define BOMBA_PIN  14
+#define SOIL_PIN   36
+
+#define BTN_NAV    25
+#define BTN_OK     4
+
+#define BUZZER_PIN 2
+#define BUZZER_FREQ 4000
+#define BUZZER_RES  8
+
+// SETPOINTS CLIMA
+float TEMP_LIGAR = 23.0;
+float TEMP_DESLIGAR = 22.0;
+float HUMR_MIN = 50.0;
+float HUMR_MAX = 70.0;
+const float VPD_MIN = 0.4;
+const float VPD_MAX = 0.8;
+
+// SETPOINTS IRRIGAÇÃO
+int HUM_SOLO_LIGAR = 60;
+int HUM_SOLO_DESLIGAR = 80;
+const int VALOR_SECO = 4095;
+const int VALOR_MOLHADO = 1213;
+
+// INICIALIZAÇÃO DAS VARIÁVEIS CLIMA
+float temperatura = 0;
+float pressao = 0;
+float humidadeR = 0;
+float vpd = 0;
+bool fanAtiva = false;
+bool modoManualClima = false;
+
+//INICIALIZAÇÃO DAS VARIÁVEIS IRRIGAÇÃO
+int humidadeSolo = 0;
+int valorBrutoSolo = 0;
+bool bombaAtiva = false;
+bool modoManualIrriga = false;
+
+// INICIALIZAÇÃO DAS VARIÁVEIS BUZZER
+bool buzzerAtivo = false;
+bool loraOK = false;
+bool bmeOK = false;
+bool soloOK = false;
+
+// DEFENIÇÃO DOS INTERVALOS DE TEMPOS DE ENVIO, LEITURA, ETC
+const unsigned long INTERVALO_CLIMA = 3000;
+const unsigned long INTERVALO_IRRIGA = 3000;
+const unsigned long INTERVALO_LORA = 5000;
+const unsigned long INTERVALO_SHEET = 15000;
+const unsigned long REFRESH_DISPLAY = 30000;
+
+// INICIALIZAÇÃO DAS VARIÁVEIS DE TEMPOS DE LEITURA
+unsigned long ultimaLeituraClima = 0;
+unsigned long ultimaLeituraIrriga = 0;
+unsigned long ultimoEnvioLoRa = 0;
+unsigned long ultimoEnvioSheetClima = 0;
+unsigned long ultimoEnvioSheetIrriga = 0;
+unsigned long ultimoRefreshDisplay = 0;
+
+// INICIALIZAÇÃO DE VARIAVEIS PARA BOTÕES DE NAVEGAÇÃO E DE CONTROLO
+unsigned long ultimoBtnNav = 0;
+unsigned long ultimoBtnOk = 0;
+const unsigned long DEBOUNCE_MS = 200;
+bool lastNav = HIGH;
+bool lastOk = HIGH;
+
+// INICIALIZAÇÃO DE VARIAVEIS PARA OLED MENU
+int pagina = 0;
+int menuIndex = 0;
+bool precisaAtualizarEcra = true;
+const char* menu[] = {                                                         //Defenição da variavel que define que páginas existem no OLED
+  "IRRIGACAO",
+  "ILUMINACAO",
+  "CLIMA",
+  "CO2",
+  "PH",
+  "ENERGIA"
+};
+const int MENU_SIZE = 6; 
+
+// CONTROLO DE ENVIO THINGSPEAK SÓ QUANDO MUDA ALGO
+float ultimaTempSheet = -999;                                                 //-999, uma vez que é um número impossivel de se obter no sistema, logo não irá haver conflito ao se verificar os envios
+float ultimaPressSheet = -999;
+float ultimaHumRSheet = -999;
+float ultimoVPDSheet = -999;
+bool ultimaFanSheet = false;
+bool ultimoModoClimaSheet = false;
+float ultimoTempLigarSheet = -999;
+float ultimoTempDesligarSheet = -999;
+bool primeiroEnvioClima = true;
+int ultimaHumSoloSheet = -999;
+int ultimoBrutoSoloSheet = -999;
+bool ultimaBombaSheet = false;
+bool ultimoModoIrrigaSheet = false;
+int ultimoHumSoloLigarSheet = -999;
+int ultimoHumSoloDesligarSheet = -999;
+bool primeiroEnvioIrriga = true;
+
+// FUNÇÕES AUXILIARES CLIMA
+float calcularVPD(float tempC, float rh) {
+  float svp = 0.6108 * exp((17.27 * tempC) / (tempC + 237.3));                //Fórmula prsente na LITERATURE REVIEW
+  return svp * (1.0 - (rh / 100.0));
+}
+
+String estadoClima() {
+  String estadoClima() {
+  if (!bmeOK) return "ERRO BME280";
+
+  if (temperatura < TEMP_DESLIGAR) return "TEMP BAIXA";
+  if (temperatura > TEMP_LIGAR) return "TEMP ALTA";
+  if (humidadeR < HUMR_MIN) return "HUM BAIXA";
+  if (humidadeR > HUMR_MAX) return "HUM ALTA";
+  if (vpd < VPD_MIN) return "VPD BAIXO";
+  if (vpd > VPD_MAX) return "VPD ALTO";
+  return "CLIMA OK";
+}
+  if (temperatura < TEMP_DESLIGAR) return "TEMP BAIXA";                        //Estados de aviso no Display Nextion
+  if (temperatura > TEMP_LIGAR) return "TEMP ALTA";
+  if (humidadeR < HUMR_MIN) return "HUM BAIXA";
+  if (humidadeR > HUMR_MAX) return "HUM ALTA";
+  if (vpd < VPD_MIN) return "VPD BAIXO";
+  if (vpd > VPD_MAX) return "VPD ALTO";
+  return "CLIMA OK";
+}
+
+// FUNÇÕES AUXILIARES IRRIGAÇÃO
+bool sensorSoloErro() {
+  return (valorBrutoSolo <= 0 || valorBrutoSolo >= 4095);
+}
+
+String estadoIrriga() {
+  if (sensorSoloErro()) return "ERRO SENSOR";
+  if (humidadeSolo < HUM_SOLO_LIGAR) return "SOLO SECO";
+  if (humidadeSolo > HUM_SOLO_DESLIGAR) return "SOLO MOLHADO";
+  return "SOLO OK";
+}
+
+// BUZZER
+void ligarBuzzer() {
+  if (!buzzerAtivo) {
+    ledcWrite(BUZZER_PIN, 128);                                              //Ligar buzzer a 50% da capacidade total, 0-255
+    buzzerAtivo = true;
+    Serial.println("BUZZER ON");
+  }
+} 
+
+void desligarBuzzer() {
+  if (buzzerAtivo) {
+    ledcWrite(BUZZER_PIN, 0);
+    buzzerAtivo = false;
+    Serial.println("BUZZER OFF");
+  }
+}
+
+void atualizarBuzzer() {
+  bool alarmeClima = (estadoClima() != "CLIMA OK");
+  bool alarmeIrriga = (estadoIrriga() != "SOLO OK");
+
+  if (alarmeClima || alarmeIrriga) {
+    ligarBuzzer();
+  } else {
+    desligarBuzzer();
+  }
+}
+
+// LEITURAS   DOS SENSORES
+void lerClima() {
+ if (!bmeOK) {
+    Serial.println("BME280 indisponivel - leitura de clima ignorada");
+    precisaAtualizarEcra = true;
+    atualizarBuzzer();
+    return;
+  }
+
+  float novaTemp = BME280.readTemperature();
+  float novaPressao = BME280.readPressure();
+  float novaHumR = BME280.readHumidity();
+
+  if (isnan(novaTemp) || isnan(novaPressao) || isnan(novaHumR)) {
+    bmeOK = false;
+    Serial.println("Erro de leitura BME280 - clima desativado");
+    precisaAtualizarEcra = true;
+    atualizarBuzzer();
+    return;
+  }
+
+  temperatura = novaTemp;
+  pressao = novaPressao;
+  humidadeR = novaHumR;
+  vpd = calcularVPD(temperatura, humidadeR);
+
+
+  Serial.print("CLIMA -> T=");
+  Serial.print(temperatura);
+  Serial.print(" HR=");
+  Serial.print(humidadeR);
+  Serial.print(" P=");
+  Serial.print(pressao);
+  Serial.print(" VPD=");
+  Serial.print(vpd);
+  Serial.print(" Estado=");
+  Serial.println(estadoClima());
+
+  atualizarBuzzer();
+  precisaAtualizarEcra = true;
+}
+
+void lerIrriga() {
+  long soma = 0;
+
+  for (int i = 0; i < 20; i++) {                                              //Realiza uma média de forma a reduzir as flutuações de valores
+    soma += analogRead(SOIL_PIN);
+    delay(5);
+  }
+
+  valorBrutoSolo = soma / 20;
+
+  humidadeSolo = map(valorBrutoSolo, VALOR_SECO, VALOR_MOLHADO, 0, 100);
+  humidadeSolo = constrain(humidadeSolo, 0, 100);                            //Garante que valor está entre 0% e 100%
+
+  Serial.print("IRRIGA -> Hum=");
+  Serial.print(humidadeSolo);
+  Serial.print("% Bruto=");
+  Serial.print(valorBrutoSolo);
+  Serial.print(" Estado=");
+  Serial.println(estadoIrriga());
+
+  atualizarBuzzer();
+  precisaAtualizarEcra = true;
+}
+
+//LIGAR/DESLIGAR ATUADORES
+void ligarFan() {
+  if (fanAtiva) return;
+
+  fanAtiva = true;
+  digitalWrite(FAN_PIN, HIGH);
+
+  Serial.println("VENTOINHA LIGADA");
+  precisaAtualizarEcra = true;
+  enviarLoRaClima();
+}
+
+void desligarFan() {
+  if (!fanAtiva) return;
+
+  fanAtiva = false;
+  digitalWrite(FAN_PIN, LOW);
+
+  Serial.println("VENTOINHA DESLIGADA");
+  precisaAtualizarEcra = true;
+  enviarLoRaClima();
+}
+
+void ligarBomba() {
+  if (bombaAtiva) return;
+
+  bombaAtiva = true;
+  digitalWrite(BOMBA_PIN, HIGH);
+
+  Serial.println("BOMBA LIGADA");
+  precisaAtualizarEcra = true;
+  enviarLoRaIrriga();
+}
+
+void desligarBomba() {
+  if (!bombaAtiva) return;
+
+  bombaAtiva = false;
+  digitalWrite(BOMBA_PIN, LOW);
+
+  Serial.println("BOMBA DESLIGADA");
+  precisaAtualizarEcra = true;
+  enviarLoRaIrriga();
+}
+
+// THINGSPEAK E SUA ATUALIZAÇÃO
+void enviarThingSpeakClima() {
+  if (!bmeOK) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;                                                  //Cria um objeto HTTP
+  String url = server + "?api_key=" + apiKeyClima;                   //Identifica o canal
+  url += "&field1=" + String(temperatura);                           //Identiifica os campos
+  url += "&field2=" + String(pressao);
+  url += "&field3=" + String(humidadeR);
+  url += "&field4=" + String(fanAtiva ? 1 : 0);
+  url += "&field5=" + String(modoManualClima ? 1 : 0);
+  url += "&field6=" + String(TEMP_LIGAR, 1);
+  url += "&field7=" + String(TEMP_DESLIGAR, 1);
+  url += "&field8=" + String(vpd, 2);
+
+  http.begin(url);
+  http.setTimeout(800);
+  int httpCode = http.GET();                                          //Os dados irão no próprio link
+  http.end();
+
+  Serial.print("ThingSpeak CLIMA HTTP = ");
+  Serial.println(httpCode);                                           //se aparecer 200 significa envio com sucesso
+}
+
+void enviarThingSpeakIrriga() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  String url = server + "?api_key=" + apiKeyIrriga;
+  url += "&field1=" + String(humidadeSolo);
+  url += "&field2=" + String(valorBrutoSolo);
+  url += "&field3=" + String(bombaAtiva ? 1 : 0);
+  url += "&field4=" + String(modoManualIrriga ? 1 : 0);
+  url += "&field5=" + String(HUM_SOLO_LIGAR);
+  url += "&field6=" + String(HUM_SOLO_DESLIGAR);
+
+  http.begin(url);
+  http.setTimeout(800);
+  int httpCode = http.GET();
+  http.end();
+
+  Serial.print("ThingSpeak IRRIGA HTTP = ");
+  Serial.println(httpCode);
+}
+
+void verificarThingSpeakClima(unsigned long agora) {
+  bool mudou =                                                            //Verifica se :
+    abs(temperatura - ultimaTempSheet) >= 0.2 ||                          //Temperatura variou mais de 0.2 graus celsius
+    abs(pressao - ultimaPressSheet) >= 20 ||                              //Pressão variou mais de 20 Pa
+    abs(humidadeR - ultimaHumRSheet) >= 1 ||                              // Humidade relativa variou mais de 1%
+    abs(vpd - ultimoVPDSheet) >= 0.05 ||                                  //VPD variou mais de 0.05 KPa
+    fanAtiva != ultimaFanSheet ||                                         //E se os estados dos atuadores e setpoints alteraram
+    modoManualClima != ultimoModoClimaSheet ||
+    TEMP_LIGAR != ultimoTempLigarSheet ||
+    TEMP_DESLIGAR != ultimoTempDesligarSheet ||
+    primeiroEnvioClima;
+
+  if (agora - ultimoEnvioSheetClima >= INTERVALO_SHEET && mudou) {        //Verifica se já passou o tempo mínimo de envio desde o último envio ou se algo mudou e depois decide se envia dados 
+    ultimoEnvioSheetClima = agora;
+    enviarThingSpeakClima();
+
+    ultimaTempSheet = temperatura;                                        //Atualiza os registos dos valores e estados das variáveis
+    ultimaPressSheet = pressao;
+    ultimaHumRSheet = humidadeR;
+    ultimoVPDSheet = vpd;
+    ultimaFanSheet = fanAtiva;
+    ultimoModoClimaSheet = modoManualClima;
+    ultimoTempLigarSheet = TEMP_LIGAR;
+    ultimoTempDesligarSheet = TEMP_DESLIGAR;
+    primeiroEnvioClima = false;                                            
+  }
+}
+
+void verificarThingSpeakIrriga(unsigned long agora) {
+  bool mudou =                                                            //Verifica se :
+    abs(humidadeSolo - ultimaHumSoloSheet) >= 1 ||                        //Humidade do solo variou mais de 1%
+    abs(valorBrutoSolo - ultimoBrutoSoloSheet) >= 10 ||                   // Valor bruto da humidade variou mais de 10 unidades
+    bombaAtiva != ultimaBombaSheet ||                                     //E se os estados dos atuadores e setpoints alteraram
+    modoManualIrriga != ultimoModoIrrigaSheet ||
+    HUM_SOLO_LIGAR != ultimoHumSoloLigarSheet ||
+    HUM_SOLO_DESLIGAR != ultimoHumSoloDesligarSheet ||
+    primeiroEnvioIrriga;
+
+  if (agora - ultimoEnvioSheetIrriga >= INTERVALO_SHEET && mudou) {
+    ultimoEnvioSheetIrriga = agora;
+    enviarThingSpeakIrriga();
+
+    ultimaHumSoloSheet = humidadeSolo;
+    ultimoBrutoSoloSheet = valorBrutoSolo;
+    ultimaBombaSheet = bombaAtiva;
+    ultimoModoIrrigaSheet = modoManualIrriga;
+    ultimoHumSoloLigarSheet = HUM_SOLO_LIGAR;
+    ultimoHumSoloDesligarSheet = HUM_SOLO_DESLIGAR;
+    primeiroEnvioIrriga = false;
+  }
+}
+
+// COMUNICAÇÃO LORA
+void enviarLoRaClima() {                                          //Pacote enviado para o ESP2 contém valores e estados booleanos de forma a simplificar o pacote de envio
+  if (!loraOK) {
+  Serial.println("LoRa indisponivel - pacote CLIMA nao enviado");
+  return;
+}
+  String pacote = "CLIMA:";
+  pacote += String(temperatura) + ",";
+  pacote += String(pressao) + ",";
+  pacote += String(humidadeR) + ",";
+  pacote += String(fanAtiva ? 1 : 0) + ",";                       //Estados booleanos
+  pacote += String(modoManualClima ? 1 : 0) + ",";
+  pacote += String(TEMP_LIGAR, 1) + ",";                          //Defenição de casas decimais
+  pacote += String(TEMP_DESLIGAR, 1) + ",";                
+  pacote += String(HUMR_MIN, 0) + ",";                            
+  pacote += String(HUMR_MAX, 0) + ",";
+  pacote += String(vpd, 2) + ",";
+  pacote += String(bmeOK ? 1 : 0);
+
+  LoRa.beginPacket();
+  LoRa.print(pacote);
+  LoRa.endPacket();
+
+  Serial.print("LoRa CLIMA enviado: ");
+  Serial.println(pacote);
+}
+
+void enviarLoRaIrriga() {                                       //Segue a mesma lógica do clima
+  if (!loraOK) {
+  Serial.println("LoRa indisponivel - pacote IRRIGA nao enviado");
+  return;
+}
+  String pacote = "IRRIGA:";
+  pacote += String(humidadeSolo) + ",";
+  pacote += String(valorBrutoSolo) + ",";
+  pacote += String(bombaAtiva ? 1 : 0) + ",";
+  pacote += String(modoManualIrriga ? 1 : 0) + ",";
+  pacote += String(HUM_SOLO_LIGAR) + ",";
+  pacote += String(HUM_SOLO_DESLIGAR) + ",";
+  pacote += String(sensorSoloErro() ? 0 : 1);
+
+  LoRa.beginPacket();
+  LoRa.print(pacote);
+  LoRa.endPacket();
+
+  Serial.print("LoRa IRRIGA enviado: ");
+  Serial.println(pacote);
+}
+
+void enviarLoRaTudo() {                                          //Assegura com 80 ms que não há conflito de envio de pacotes 
+  enviarLoRaClima();
+  delay(80);
+  enviarLoRaIrriga();
+}
+
+// SETPOINTS
+void atualizarSetpointsClima(String cmd) {                       //Verifica o pacote
+  int p1 = cmd.indexOf(':');
+  int p2 = cmd.indexOf(',', p1 + 1);
+  int p3 = cmd.indexOf(',', p2 + 1);
+  int p4 = cmd.indexOf(',', p3 + 1);
+
+  if (p1 > 0 && p2 > p1 && p3 > p2 && p4 > p3) {                  //Verifica estrutura do pacote
+    float novoTempOn = cmd.substring(p1 + 1, p2).toFloat();       //Extrai a informação para cada variavel
+    float novoTempOff = cmd.substring(p2 + 1, p3).toFloat();
+    float novaHumMin = cmd.substring(p3 + 1, p4).toFloat();
+    float novaHumMax = cmd.substring(p4 + 1).toFloat();
+
+    if (novoTempOn > novoTempOff && novaHumMin < novaHumMax &&
+        novaHumMin >= 0 && novaHumMax <= 100) {
+
+      TEMP_LIGAR = novoTempOn;
+      TEMP_DESLIGAR = novoTempOff;
+      HUMR_MIN = novaHumMin;
+      HUMR_MAX = novaHumMax;
+
+      Serial.println("Setpoints CLIMA atualizados");
+      atualizarBuzzer();
+      precisaAtualizarEcra = true;
+      enviarLoRaClima();
+    } else {
+      Serial.println("ERRO setpoints CLIMA invalidos");
+    }
+  }
+}
+
+void atualizarSetpointsIrriga(String cmd) {
+  int p1 = cmd.indexOf(':');                                                           //Guarda a posição dos :
+  int p2 = cmd.indexOf(',');                                                            //Guarda a posição da  , 
+
+  if (p1 > 0 && p2 > p1) {
+    int novoLigar = cmd.substring(p1 + 1, p2).toInt();                                 // Extrai unicamente os valores, daí o +1, para garantir que não inclui : ou ,
+    int novoDesligar = cmd.substring(p2 + 1).toInt();
+
+    if (novoLigar >= 0 && novoDesligar <= 100 && novoLigar < novoDesligar) {          //Verifica os Valores Extraídos
+      HUM_SOLO_LIGAR = novoLigar;
+      HUM_SOLO_DESLIGAR = novoDesligar;
+
+      Serial.println("Setpoints IRRIGA atualizados");
+      atualizarBuzzer();
+      precisaAtualizarEcra = true;
+      enviarLoRaIrriga();
+    } else {
+      Serial.println("ERRO setpoints IRRIGA invalidos");
+    }
+  }
+}
+
+// PROCESSAMENTO DOS COMANDOS
+void processarComando(String cmd) {
+  cmd.trim();                                                          //Assegura a eleminação de lixo
+  Serial.print("Comando recebido no ESP1: [");
+  Serial.print(cmd);
+  Serial.println("]");
+
+  if (cmd == "FAN_ON") {
+    modoManualClima = true;
+    ligarFan();
+  }
+
+  else if (cmd == "FAN_OFF") {
+    modoManualClima = true;
+    desligarFan();
+  }
+
+  else if (cmd == "BOMBA_ON") {
+    modoManualIrriga = true;
+    ligarBomba();
+  }
+
+  else if (cmd == "BOMBA_OFF") {
+    modoManualIrriga = true;
+    desligarBomba();
+  }
+
+  else if (cmd == "MODO_AUTO_CLIMA") {
+    modoManualClima = false;
+    Serial.println("CLIMA AUTO");
+    enviarLoRaClima();
+  }
+
+  else if (cmd == "MODO_AUTO_IRRIGA") {
+    modoManualIrriga = false;
+    Serial.println("IRRIGA AUTO");
+    enviarLoRaIrriga();
+  }
+
+  else if (cmd == "MODO_AUTO") {                               //se o botão antigo ainda mandar MODO_AUTO, mete ambos em auto
+    modoManualClima = false;
+    modoManualIrriga = false;
+    Serial.println("CLIMA + IRRIGA AUTO");
+    enviarLoRaTudo();
+  }
+
+  else if (cmd.startsWith("SET_TEMP:")) {                     //Verifica qual sistema está a receber informação nova e manda-o atualizar
+    atualizarSetpointsClima(cmd);
+  }
+
+  else if (cmd.startsWith("SET_SOIL:")) {
+    atualizarSetpointsIrriga(cmd);
+  }
+
+  else if (cmd == "REQUEST_DATA") {
+    lerClima();
+    lerIrriga();
+    enviarLoRaTudo();
+  }
+
+  else {
+    Serial.println("Comando desconhecido no ESP1");
+  }
+}
+
+//DISPLAY OLED
+void drawMenu() {
+  u8g2.clearBuffer();                                                 //Criação da página do menu
+  u8g2.setDrawColor(1);                                               //Desenhar com pixeis ligados
+
+  u8g2.setFont(u8g2_font_6x10_tr);                                   // Desenha o cabeçalho
+  u8g2.drawStr(46, 10, "MENU");                                      //Indica a posição do texto
+  u8g2.drawHLine(0, 12, 128);
+
+  int x[2] = {2, 66};                                                //posição das colunas e linhas do menu
+  int y[3] = {26, 40, 54};
+  for (int i = 0; i < MENU_SIZE; i++) {                              //Define posição de cada título no menu
+    int col = i % 2;
+    int row = i / 2;
+
+    if (i == menuIndex) {                                             //Criação da caixa branca 
+      u8g2.drawRBox(x[col] - 2, y[row] - 10, 62, 13, 2);
+      u8g2.setDrawColor(0);
+      u8g2.drawStr(x[col], y[row], menu[i]);
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.drawStr(x[col], y[row], menu[i]);
+    }
+  }
+  u8g2.sendBuffer();                                                  //Faz com que o ecrã atualize
+}
+
+void pageIrrigacao() {
+  char linha[32];
+
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(22, 10, "IRRIGACAO");
+  u8g2.setFont(u8g2_font_5x7_tr);
+
+  sprintf(linha, "Hum solo: %d%%", humidadeSolo);
+  u8g2.drawStr(0, 22, linha);
+
+  sprintf(linha, "Bruto: %d", valorBrutoSolo);
+  u8g2.drawStr(0, 32, linha);
+
+  sprintf(linha, "Bomba:%s Modo:%s",
+          bombaAtiva ? "ON" : "OFF",
+          modoManualIrriga ? "MAN" : "AUTO");
+  u8g2.drawStr(0, 42, linha);
+
+  sprintf(linha, "Set:%d/%d Buz:%s",
+          HUM_SOLO_LIGAR,
+          HUM_SOLO_DESLIGAR,
+          buzzerAtivo ? "ON" : "OFF");
+  u8g2.drawStr(0, 52, linha);
+
+  u8g2.drawStr(0, 62, estadoIrriga().c_str());                           //.c_str converte o formato de string para const char*
+  u8g2.sendBuffer();
+}
+
+void pageClima() {
+  char linha[32];
+
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(38, 10, "CLIMA");
+
+  u8g2.setFont(u8g2_font_5x7_tr);
+
+  sprintf(linha, "T:%.1fC HR:%.1f%%", temperatura, humidadeR);
+  u8g2.drawStr(0, 22, linha);
+
+  sprintf(linha, "VPD:%.2f P:%.0f", vpd, pressao);
+  u8g2.drawStr(0, 32, linha);
+
+  sprintf(linha, "Fan:%s Modo:%s",
+          fanAtiva ? "ON" : "OFF",
+          modoManualClima ? "MAN" : "AUTO");
+  u8g2.drawStr(0, 42, linha);
+
+  sprintf(linha, "SetT:%.1f/%.1f", TEMP_LIGAR, TEMP_DESLIGAR);
+  u8g2.drawStr(0, 52, linha);
+
+  u8g2.drawStr(0, 62, estadoClima().c_str());
+  u8g2.sendBuffer();
+}
+
+void pageNaoAtivo(const char* titulo) {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(25, 10, titulo);
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(0, 28, "Modulo nao ativo");
+  u8g2.drawStr(0, 45, "OK: voltar");
+  u8g2.sendBuffer();
+}
+
+void atualizarDisplay() {
+  switch (pagina) {
+    case 0: drawMenu(); break;
+    case 1: pageIrrigacao(); break;
+    case 2: pageNaoAtivo("ILUMINACAO"); break;
+    case 3: pageClima(); break;
+    case 4: pageNaoAtivo("CO2"); break;
+    case 5: pageNaoAtivo("PH"); break;
+    case 6: pageNaoAtivo("ENERGIA"); break;
+  }
+}
+
+
+
+
+
+// SETUP
+void setup() {
+  Serial.begin(115200);                                                      //Baud rate utilizada, rápida e estável
+  delay(1000);
+
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW);                                               //Garante que atuador começa OFF
+
+  pinMode(BOMBA_PIN, OUTPUT);
+  digitalWrite(BOMBA_PIN, LOW);
+
+  pinMode(BTN_NAV, INPUT_PULLUP);
+  pinMode(BTN_OK, INPUT_PULLUP);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  ledcAttach(BUZZER_PIN, BUZZER_FREQ, BUZZER_RES);                         //PWM
+  ledcWrite(BUZZER_PIN, 0);                                                //Inicia desligado
+
+  Wire.begin(21, 22);
+  Wire.setClock(50000);                                                    //Velocidade de 50KHz para tentar evitar instabilidade no barramento I2C
+
+  u8g2.setBusClock(400000);                                               //Velocidade de 400 KHz
+  u8g2.begin();
+  atualizarDisplay();
+
+  if (BME280.begin(0x76)) {
+  bmeOK = true;
+  Serial.println("BME280 OK em 0x76");
+}
+else if (BME280.begin(0x77)) {
+  bmeOK = true;
+  Serial.println("BME280 OK em 0x77");
+}
+else {
+  bmeOK = false;
+  Serial.println("BME280 nao encontrado - sistema continua sem clima");
+}
+
+  WiFi.begin(ssid, password);                                             //Inicia a ligação WIFI
+
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+  }
+
+  Serial.println();
+  Serial.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi falhou");
+
+  SPI.begin(5, 19, 27, 18);                                                //Comunicação SPI
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);                              //Inicia os pinos LoRa
+
+  if (!LoRa.begin(868E6)) {
+    loraOK = true;
+    Serial.println("LoRa OK");
+  }else{
+    loraOK = false;
+    Serial.printlln("LoRa falhou - Controlo Local continua sem LoRa")
+  }
+
+
+  lerClima();
+  lerIrriga();
+  enviarLoRaTudo();
+  precisaAtualizarEcra = true;
+}
+
+// LOOP
+void loop() {
+  unsigned long agora = millis();                                          //Contagem de tempo desde que o programa inicia
+
+  bool nav = digitalRead(BTN_NAV);                                         //Lê o estado dos botões
+  bool ok = digitalRead(BTN_OK);
+  if (ok == LOW && lastOk == HIGH && (agora - ultimoBtnOk > DEBOUNCE_MS)) {   //Verifica estado anterior do botão e tempo mínimo de leitura
+    ultimoBtnOk = agora;
+    if (pagina == 0) {                                                         // se está na página do menu entra na página selecionada, se está dentro de uma página, volta ao menu
+      pagina = menuIndex + 1;
+    } else {
+      pagina = 0;
+
+    }
+    precisaAtualizarEcra = true;
+  }
+
+  if (nav == LOW && lastNav == HIGH && (agora - ultimoBtnNav > DEBOUNCE_MS)) {   
+    ultimoBtnNav = agora;                                                         
+    if (pagina == 0) {                                                            //se estiver no menu passa para a próxima opção
+      menuIndex++;
+      if (menuIndex >= MENU_SIZE) menuIndex = 0;
+      precisaAtualizarEcra = true;
+    }
+  }
+  lastNav = nav;
+  lastOk = ok;
+
+
+  if (Serial.available()) {                                                     //Verifica se algum comando foi enviado  diretamente através do serial monitor e processa-o
+    String cmd = Serial.readString();
+    cmd.trim();
+    if (cmd.length() > 0) {
+      processarComando(cmd);
+    }
+  }
+
+
+  if (loraOK) {
+  int packetSize = LoRa.parsePacket();                                         //Verifica se algum pacote chegou por LoRa
+
+  if (packetSize) {
+    String cmd = "";
+    while (LoRa.available()) {
+      cmd += (char)LoRa.read();
+    }
+    Serial.print("LORA RECEBIDO NO ESP1 = [");
+    Serial.print(cmd);
+    Serial.println("]");
+    processarComando(cmd);
+  }
+}
+
+  if (agora - ultimaLeituraClima >= INTERVALO_CLIMA) {
+    ultimaLeituraClima = agora;
+    lerClima();
+  }
+  if (agora - ultimaLeituraIrriga >= INTERVALO_IRRIGA) {
+    ultimaLeituraIrriga = agora;
+    lerIrriga();
+  }
+
+
+  if (agora - ultimoEnvioLoRa >= INTERVALO_LORA) {                            //Envio de dados por LoRa
+    ultimoEnvioLoRa = agora;
+    enviarLoRaTudo();
+  }
+
+
+  verificarThingSpeakClima(agora);                                          //Verifica se deve enviar dados para a base de dados
+  verificarThingSpeakIrriga(agora);
+
+
+  if (!modoManualClima) {
+  if (bmeOK) {
+    if (!fanAtiva && temperatura > TEMP_LIGAR) {
+      ligarFan();
+    }
+    if (fanAtiva && temperatura < TEMP_DESLIGAR) {
+      desligarFan();
+    }
+  } else {
+    if (fanAtiva) desligarFan();
+  }
+}
+
+if (!modoManualIrriga) {
+  if (!sensorSoloErro()) {
+    if (!bombaAtiva && humidadeSolo < HUM_SOLO_LIGAR) {
+      ligarBomba();
+    }
+    if (bombaAtiva && humidadeSolo > HUM_SOLO_DESLIGAR) {
+      desligarBomba();
+    }
+  } else {
+    if (bombaAtiva) desligarBomba();
+  }
+}
+
+  atualizarBuzzer();
+
+  if (agora - ultimoRefreshDisplay >= REFRESH_DISPLAY) {
+    ultimoRefreshDisplay = agora;
+    precisaAtualizarEcra = true;
+  }
+  if (precisaAtualizarEcra) {
+    atualizarDisplay();
+    precisaAtualizarEcra = false;
+  }
+  delay(10);
+}
 
