@@ -1,1 +1,354 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <BH1750.h>
+
+BH1750 lightMeter;
+
+// LIGAÇÃO WIFI
+const char* ssid = "Vodafone-2C9BF9";
+const char* password = "g4n8tUuuh2";
+
+//THINGSPEAK - ILUMINAÇÃO
+const String apiKey = "FCLWKMOHAF15WMZF";
+const String server = "http://api.thingspeak.com/update";
+
+// Defenição de pinos, inicialização de variáveis
+#define LORA_SS   18
+#define LORA_RST  23
+#define LORA_DIO0 26
+#define LED_PIN 15
+#define LED_FREQ 5000
+#define LED_RES  8
+
+const float FATOR_LUX_PARA_PPFD = 54.0;
+float PPFD_MIN = 200.0;   
+float PPFD_MAX = 300.0;   
+const float PPFD_AVISO_BAIXO = 100.0;
+const float PPFD_AVISO_ALTO  = 500.0;
+const int PASSO_PWM = 10;
+float lux = 0;
+float ppfd = 0;
+int pwmLed = 0;          // 0 a 255
+int percentLed = 0;      // 0 a 100
+bool ledAtivo = false;
+bool modoManual = false;
+bool sensorOK = false;
+bool loraOK = false;
+const unsigned long INTERVALO_LEITURA = 3000;
+const unsigned long INTERVALO_LORA = 5000;
+const unsigned long INTERVALO_SHEET = 15000;
+unsigned long ultimaLeitura = 0;
+unsigned long ultimoEnvioLoRa = 0;
+unsigned long ultimoEnvioSheet = 0;
+float ultimoLuxSheet = -999;
+float ultimoPPFDSheet = -999;
+int ultimoPercentSheet = -999;
+bool ultimoLedSheet = false;
+bool ultimoModoSheet = false;
+bool ultimoSensorOKSheet = true;
+float ultimoPPFDMinSheet = -999;
+float ultimoPPFDMaxSheet = -999;
+bool primeiroEnvioSheet = true;
+
+//ESTADO - ALERTAS DISPLAY NEXTION
+String estadoIluminacao() {
+  if (!sensorOK) return "ERRO SENSOR";
+  if (ppfd < PPFD_AVISO_BAIXO) return "LUZ MUITO BAIXA";
+  if (ppfd > PPFD_AVISO_ALTO)  return "LUZ MUITO ALTA";
+  if (ppfd < PPFD_MIN) return "ABAIXO IDEAL";
+  if (ppfd > PPFD_MAX) return "ACIMA IDEAL";
+  return "LUZ OK";
+}
+
+// PWM - CONTROLO VARIÁVEL DOS LEDS
+void aplicarPWM() {
+  pwmLed = constrain(pwmLed, 0, 255);
+  percentLed = round((pwmLed / 255.0) * 100.0);
+  ledcWrite(LED_PIN, pwmLed);
+  ledAtivo = pwmLed > 0;
+}
+
+// INICIALIZAÇÃO DO SENSOR
+bool iniciarBH1750() {
+  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    sensorOK = true;
+    Serial.println("BH1750 OK");
+    return true;
+  }
+  sensorOK = false;
+  Serial.println("BH1750 nao encontrado - iluminacao continua em modo degradado");
+  return false;
+}
+
+//Leitura do sensor
+void lerSensorIluminacao() {
+  if (!sensorOK) {
+    iniciarBH1750();
+    if (!sensorOK) {
+      if (!modoManual) {
+        pwmLed = 0;
+        aplicarPWM();
+      }
+      Serial.println("BH1750 indisponivel - leitura ignorada");
+      enviarLoRa();
+      return;
+    }
+  }
+  float leitura = lightMeter.readLightLevel();
+
+  if (isnan(leitura) || leitura < 0) {
+    sensorOK = false;
+    if (!modoManual) {
+      pwmLed = 0;
+      aplicarPWM();
+    }
+    Serial.println("Erro na leitura do BH1750 - sistema continua");
+    enviarLoRa();
+    return;
+  }
+
+  sensorOK = true;
+  lux = leitura;
+  ppfd = lux / FATOR_LUX_PARA_PPFD;
+  if (!modoManual) {
+    if (ppfd < PPFD_MIN) {
+      pwmLed += PASSO_PWM;
+    } else if (ppfd > PPFD_MAX) {
+      pwmLed -= PASSO_PWM;
+    }
+    aplicarPWM();
+  }
+
+  Serial.print("Lux: ");
+  Serial.print(lux);
+  Serial.println(" lx");
+  Serial.print("PPFD: ");
+  Serial.print(ppfd);
+  Serial.println(" umol/m2/s");
+  Serial.print("PWM LED: ");
+  Serial.print(pwmLed);
+  Serial.print(" / 255 (");
+  Serial.print(percentLed);
+  Serial.println("%)");
+  Serial.print("Set PPFD: ");
+  Serial.print(PPFD_MIN);
+  Serial.print(" - ");
+  Serial.println(PPFD_MAX);
+  Serial.print("Modo: ");
+  Serial.println(modoManual ? "MANUAL" : "AUTO");
+  Serial.print("Estado: ");
+  Serial.println(estadoIluminacao());
+}
+
+// CRIAÇÃO DO PACOTE LORA A SER ENVIADO
+void enviarLoRa() {
+  if (!loraOK) {
+    Serial.println("LoRa indisponivel - pacote ILUM nao enviado");
+    return;
+  }
+
+  String pacote = "ILUM:";
+  pacote += String(lux, 1) + ",";
+  pacote += String(ppfd, 1) + ",";
+  pacote += String(percentLed) + ",";
+  pacote += String(ledAtivo ? 1 : 0) + ",";
+  pacote += String(modoManual ? 1 : 0) + ",";
+  pacote += String(sensorOK ? 1 : 0) + ",";
+  pacote += String(PPFD_MIN, 0) + ",";
+  pacote += String(PPFD_MAX, 0) + ",1";
+
+  LoRa.beginPacket();
+  LoRa.print(pacote);
+  LoRa.endPacket();
+  Serial.print("LoRa ILUM enviado: ");
+  Serial.println(pacote);
+}
+
+//THINGSPEAK
+void enviarThingSpeak() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = server + "?api_key=" + apiKey;
+  url += "&field1=" + String(lux, 1);
+  url += "&field2=" + String(ppfd, 1);
+  url += "&field3=" + String(percentLed);
+  url += "&field4=" + String(ledAtivo ? 1 : 0);
+  url += "&field5=" + String(modoManual ? 1 : 0);
+  url += "&field6=" + String(sensorOK ? 1 : 0);
+  url += "&field7=" + String(PPFD_MIN, 0);
+  url += "&field8=" + String(PPFD_MAX, 0);
+
+  http.begin(url);
+  http.setTimeout(800);
+  int httpCode = http.GET();
+  http.end();
+  Serial.print("ThingSpeak ILUM HTTP = ");
+  Serial.println(httpCode);
+}
+
+void verificarEnviarThingSpeak(unsigned long agora) {
+  bool mudou =
+    abs(lux - ultimoLuxSheet) >= 50 ||
+    abs(ppfd - ultimoPPFDSheet) >= 2 ||
+    abs(percentLed - ultimoPercentSheet) >= 2 ||
+    ledAtivo != ultimoLedSheet ||
+    modoManual != ultimoModoSheet ||
+    sensorOK != ultimoSensorOKSheet ||
+    PPFD_MIN != ultimoPPFDMinSheet ||
+    PPFD_MAX != ultimoPPFDMaxSheet ||
+    primeiroEnvioSheet;
+
+  if (agora - ultimoEnvioSheet >= INTERVALO_SHEET && mudou) {
+    ultimoEnvioSheet = agora;
+
+    enviarThingSpeak();
+
+    ultimoLuxSheet = lux;
+    ultimoPPFDSheet = ppfd;
+    ultimoPercentSheet = percentLed;
+    ultimoLedSheet = ledAtivo;
+    ultimoModoSheet = modoManual;
+    ultimoSensorOKSheet = sensorOK;
+    ultimoPPFDMinSheet = PPFD_MIN;
+    ultimoPPFDMaxSheet = PPFD_MAX;
+    primeiroEnvioSheet = false;
+  }
+}
+
+//SETPOINTS
+void atualizarSetpointsIlum(String cmd) {
+  int p1 = cmd.indexOf(':');
+  int p2 = cmd.indexOf(',');
+
+  if (p1 > 0 && p2 > p1) {
+    float novoMin = cmd.substring(p1 + 1, p2).toFloat();
+    float novoMax = cmd.substring(p2 + 1).toFloat();
+
+    if (novoMin >= 0 && novoMax <= 1000 && novoMin < novoMax) {
+      PPFD_MIN = novoMin;
+      PPFD_MAX = novoMax;
+
+      Serial.print("NOVO PPFD_MIN = ");
+      Serial.println(PPFD_MIN);
+      Serial.print("NOVO PPFD_MAX = ");
+      Serial.println(PPFD_MAX);
+      enviarLoRa();
+    } else {
+      Serial.println("ERRO: setpoints de iluminacao invalidos");
+    }
+  }
+}
+
+//COMANDOS
+void processarComando(String cmd) {
+  cmd.trim();
+  Serial.print("Comando recebido no ESP1 ILUM: [");
+  Serial.print(cmd);
+  Serial.println("]");
+
+  if (cmd == "LED_ON") {
+    modoManual = true;
+    pwmLed = 255;
+    aplicarPWM();
+    enviarLoRa();
+  }
+  else if (cmd == "LED_OFF") {
+    modoManual = true;
+    pwmLed = 0;
+    aplicarPWM();
+    enviarLoRa();
+  }
+  else if (cmd == "MODO_AUTO_ILUM") {
+    modoManual = false;
+    Serial.println("ILUMINACAO AUTO");
+    lerSensorIluminacao();
+    enviarLoRa();
+  }
+  else if (cmd.startsWith("SET_ILUM:")) {
+    atualizarSetpointsIlum(cmd);
+  }
+  else if (cmd == "REQUEST_DATA") {
+    lerSensorIluminacao();
+    enviarLoRa();
+  }
+  else {
+    Serial.println("Comando desconhecido no ESP1 ILUM");
+  }
+}
+
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(21, 22);
+  Wire.setClock(50000);
+
+  ledcAttach(LED_PIN, LED_FREQ, LED_RES);
+  ledcWrite(LED_PIN, 0);
+  iniciarBH1750();
+
+  WiFi.begin(ssid, password);
+
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+  }
+  Serial.println();
+  Serial.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi falhou - controlo local continua");
+
+  SPI.begin(5, 19, 27, 18);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(868E6)) {
+    loraOK = true;
+    Serial.println("LoRa OK");
+  } else {
+    loraOK = false;
+    Serial.println("LoRa falhou - iluminacao continua sem LoRa");
+  }
+  lerSensorIluminacao();
+  enviarLoRa();
+}
+
+// LOOP
+void loop() {
+  unsigned long agora = millis();
+  if (Serial.available()) {
+    String cmd = Serial.readString();
+    cmd.trim();
+    if (cmd.length() > 0) {
+      processarComando(cmd);
+    }
+  }
+
+  if (loraOK) {
+    int packetSize = LoRa.parsePacket();
+    if (packetSize) {
+      String cmd = "";
+      while (LoRa.available()) {
+        cmd += (char)LoRa.read();
+      }
+      processarComando(cmd);
+    }
+  }
+
+  if (agora - ultimaLeitura >= INTERVALO_LEITURA) {
+    ultimaLeitura = agora;
+    lerSensorIluminacao();
+  }
+  if (agora - ultimoEnvioLoRa >= INTERVALO_LORA) {
+    ultimoEnvioLoRa = agora;
+    enviarLoRa();
+  }
+
+  verificarEnviarThingSpeak(agora);
+
+  delay(10);
+}
 
