@@ -5,8 +5,8 @@
 #include <HardwareSerial.h>
 
 // LIGAÇÃO WIFI
-const char* ssid = "Vodafone-2C9BF9";
-const char* password = "g4n8tUuuh2";
+const char* ssid = "";
+const char* password = "";
 
 //THINGSPEAK - ENERGIA
 const String apiKey = "C916ROM3CALY9RA2";
