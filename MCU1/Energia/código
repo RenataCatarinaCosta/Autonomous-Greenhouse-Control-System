@@ -1,0 +1,178 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
+
+// LIGAÇÃO WIFI
+const char* ssid = "Vodafone-2C9BF9";
+const char* password = "g4n8tUuuh2";
+
+//THINGSPEAK - ENERGIA
+const String apiKey = "C916ROM3CALY9RA2";
+const String server = "http://api.thingspeak.com/update";
+
+// DEFENIÇÃO DE PINOS E INICIALIZAÇÃO DE VARIÁVEIS
+#define LORA_SS   18
+#define LORA_RST  23
+#define LORA_DIO0 26
+HardwareSerial EnergiaSerial(2);
+float tensaoBateria = 0;
+int percBateria = 0;
+float correnteConsumo_mA = 0;
+float tensaoPainel = 0;
+float correntePainel_mA = 0;
+float potenciaPainel_W = 0;
+float tempEnergia = 0;
+bool dadosEnergiaRecebidos = false;
+bool loraOK = false;
+const unsigned long INTERVALO_SHEET = 15000;
+const unsigned long INTERVALO_LORA = 5000;
+unsigned long ultimoEnvioSheet = 0;
+unsigned long ultimoEnvioLoRa = 0;
+float ultimaTensaoBat = -999;
+int ultimaPercBat = -999;
+float ultimaCorrenteConsumo = -999;
+float ultimaTensaoPainel = -999;
+float ultimaCorrentePainel = -999;
+float ultimaPotencia = -999;
+float ultimaTemp = -999;
+bool primeiroEnvioSheet = true;
+
+//THINGSPEAK
+void enviarThingSpeak() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!dadosEnergiaRecebidos) return;
+  HTTPClient http;
+  String url = server + "?api_key=" + apiKey;
+  url += "&field1=" + String(tensaoBateria, 2);
+  url += "&field2=" + String(percBateria);
+  url += "&field3=" + String(correnteConsumo_mA, 1);
+  url += "&field4=" + String(tensaoPainel, 2);
+  url += "&field5=" + String(correntePainel_mA, 1);
+  url += "&field6=" + String(potenciaPainel_W, 2);
+  url += "&field7=" + String(tempEnergia, 1);
+  http.begin(url);
+  http.setTimeout(800);
+  int httpCode = http.GET();
+  http.end();
+  Serial.print("ThingSpeak HTTP code = ");
+  Serial.println(httpCode);
+}
+
+void verificarEnviarThingSpeak(unsigned long agora) {
+  bool mudou =
+    abs(tensaoBateria - ultimaTensaoBat) >= 0.05 ||
+    abs(percBateria - ultimaPercBat) >= 1 ||
+    abs(correnteConsumo_mA - ultimaCorrenteConsumo) >= 20 ||
+    abs(tensaoPainel - ultimaTensaoPainel) >= 0.1 ||
+    abs(correntePainel_mA - ultimaCorrentePainel) >= 20 ||
+    abs(potenciaPainel_W - ultimaPotencia) >= 0.1 ||
+    abs(tempEnergia - ultimaTemp) >= 0.5 ||
+    primeiroEnvioSheet;
+  if (agora - ultimoEnvioSheet >= INTERVALO_SHEET && mudou) {
+    ultimoEnvioSheet = agora;
+    enviarThingSpeak();
+    ultimaTensaoBat = tensaoBateria;
+    ultimaPercBat = percBateria;
+    ultimaCorrenteConsumo = correnteConsumo_mA;
+    ultimaTensaoPainel = tensaoPainel;
+    ultimaCorrentePainel = correntePainel_mA;
+    ultimaPotencia = potenciaPainel_W;
+    ultimaTemp = tempEnergia;
+    primeiroEnvioSheet = false;
+  }
+}
+
+// COMUNICAÇÃO LORA
+void enviarLoRaEnergia() {
+  if (!dadosEnergiaRecebidos) return;
+  if (!loraOK) {
+  Serial.println("LoRa indisponivel - dados de energia nao enviados");
+  return;
+}
+  String pacote = "ENERGIA:";
+  pacote += String(tensaoBateria, 2) + ",";
+  pacote += String(percBateria) + ",";
+  pacote += String(correnteConsumo_mA, 1) + ",";
+  pacote += String(tensaoPainel, 2) + ",";
+  pacote += String(correntePainel_mA, 1) + ",";
+  pacote += String(potenciaPainel_W, 2) + ",";
+  pacote += String(tempEnergia, 1) + ",1";
+  LoRa.beginPacket();
+  LoRa.print(pacote);
+  LoRa.endPacket();
+  Serial.print("LoRa enviado: ");
+  Serial.println(pacote);
+}
+
+//PROCESSAR ENERGIA
+void processarEnergia(String dados) {
+  dados.trim();
+  if (!dados.startsWith("ENERGIA:")) return;
+  int p1 = dados.indexOf(',');
+  int p2 = dados.indexOf(',', p1 + 1);
+  int p3 = dados.indexOf(',', p2 + 1);
+  int p4 = dados.indexOf(',', p3 + 1);
+  int p5 = dados.indexOf(',', p4 + 1);
+  int p6 = dados.indexOf(',', p5 + 1);
+
+  if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0 && p5 > 0 && p6 > 0) {
+    tensaoBateria = dados.substring(8, p1).toFloat();
+    percBateria = dados.substring(p1 + 1, p2).toInt();
+    correnteConsumo_mA = dados.substring(p2 + 1, p3).toFloat();
+    tensaoPainel = dados.substring(p3 + 1, p4).toFloat();
+    correntePainel_mA = dados.substring(p4 + 1, p5).toFloat();
+    potenciaPainel_W = dados.substring(p5 + 1, p6).toFloat();
+    tempEnergia = dados.substring(p6 + 1).toFloat();
+    dadosEnergiaRecebidos = true;
+    Serial.print("Energia recebida: ");
+    Serial.println(dados);
+    enviarLoRaEnergia();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  EnergiaSerial.begin(9600, SERIAL_8N1, 16, -1);
+  WiFi.begin(ssid, password);
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+  }
+
+  Serial.println();
+  Serial.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "WiFi falhou");
+  SPI.begin(5, 19, 27, 18);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+ if (LoRa.begin(868E6)) {
+  loraOK = true;
+  Serial.println("LoRa OK");
+} else {
+  loraOK = false;
+  Serial.println("LoRa falhou - energia continua sem LoRa");
+}
+}
+
+void loop() {
+  unsigned long agora = millis();
+  if (EnergiaSerial.available()) {
+    String linha = EnergiaSerial.readStringUntil('\n');
+    linha.trim();
+    if (linha.length() > 0) {
+      processarEnergia(linha);
+    }
+  }
+
+  if (agora - ultimoEnvioLoRa >= INTERVALO_LORA) {
+    ultimoEnvioLoRa = agora;
+    enviarLoRaEnergia();
+  }
+  verificarEnviarThingSpeak(agora);
+
+  delay(10);
+}
