@@ -1,1 +1,700 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <HardwareSerial.h>
+
+// Definição dos pinos e varriáveis
+#define LORA_SS   18
+#define LORA_RST  23
+#define LORA_DIO0 26
+HardwareSerial NextionSerial(1);
+#define BUZZER_PIN 2
+#define BUZZER_FREQ 4000
+#define BUZZER_RES  8
+
+float temperatura = 0;
+float pressao = 0;
+float humidadeR = 0;
+float vpd = 0;
+float tempLigar = 23.0;
+float tempDesligar = 22.0;
+float humRMin = 50.0;
+float humRMax = 70.0;
+const float VPD_MIN = 0.4;
+const float VPD_MAX = 0.8;
+int fanEstado = 0;
+int modoClimaEstado = 0;
+
+int humidadeSolo = 0;
+int valorBrutoSolo = 0;
+int bombaEstado = 0;
+int modoIrrigaEstado = 0;
+int humSoloLigar = 60;
+int humSoloDesligar = 80;
+bool buzzerAtivo = false;
+bool loraOK = false;
+int sensorClimaOK = 0;
+int sensorSoloOK = 0;
+
+unsigned long ultimoRecebimentoClima = 0;
+unsigned long ultimoRecebimentoIrriga = 0;
+unsigned long ultimoEnvioRequest = 0;
+String bufferNextion = "";
+unsigned long ultimoToque = 0;
+const unsigned long DEBOUNCE_NEXTION = 80;
+
+
+//COMUNICAÇÃO COM O NEXTION
+void enviarParaNextion(String comando) {
+  NextionSerial.print(comando);
+  NextionSerial.write(0xFF);
+  NextionSerial.write(0xFF);
+  NextionSerial.write(0xFF);
+}
+
+// ESTADOS DOS SISTEMAS- ALERTAS
+String estadoClima() {
+  if (ultimoRecebimentoClima == 0) return "A AGUARDAR CLIMA";
+  if (millis() - ultimoRecebimentoClima > 120000) return "SINAL PERDIDO!";
+  if (sensorClimaOK == 0) return "ERRO BME280";
+
+  if (temperatura < tempDesligar) return "TEMP BAIXA";
+  if (temperatura > tempLigar) return "TEMP ALTA";
+  if (humidadeR < humRMin) return "HUM BAIXA";
+  if (humidadeR > humRMax) return "HUM ALTA";
+  if (vpd < VPD_MIN) return "VPD BAIXO";
+  if (vpd > VPD_MAX) return "VPD ALTO";
+
+  return "CLIMA OK";
+}
+
+bool sensorSoloErro() {
+  return (valorBrutoSolo <= 0 || valorBrutoSolo >= 4095);
+}
+
+String estadoIrriga() {
+  if (ultimoRecebimentoIrriga == 0) return "A AGUARDAR SOLO";
+  if (millis() - ultimoRecebimentoIrriga > 120000) return "SINAL PERDIDO!";
+  if (sensorSoloOK == 0) return "ERRO SENSOR";
+
+  if (humidadeSolo < humSoloLigar) return "SOLO SECO";
+  if (humidadeSolo > humSoloDesligar) return "SOLO MOLHADO";
+
+  return "SOLO OK";
+}
+
+void atualizarStatusClima() {
+  String estado = estadoClima();
+
+  enviarParaNextion("tStatusClima.txt=\"" + estado + "\"");                                //Atualização do estado no display, com cores de acordo
+
+  if (estado == "CLIMA OK") {
+    enviarParaNextion("tStatusClima.pco=5653");
+  } else if (estado == "A AGUARDAR CLIMA") {
+    enviarParaNextion("tStatusClima.pco=65535");      
+  } else {
+    enviarParaNextion("tStatusClima.pco=63488");
+  }
+}
+
+void atualizarStatusIrriga() {
+  String estado = estadoIrriga();
+
+  enviarParaNextion("tStatusIrriga.txt=\"" + estado + "\"");
+
+  if (estado == "SOLO OK") {
+    enviarParaNextion("tStatusIrriga.pco=5653");
+  } else if (estado == "A AGUARDAR SOLO") {
+    enviarParaNextion("tStatusIrriga.pco=65535");
+  } else {
+    enviarParaNextion("tStatusIrriga.pco=63488");
+  }
+}
+
+
+// BUZZER
+void ligarBuzzer() {                                                                         //Controlo do alerta sonoro presente o«no MCU2
+  if (!buzzerAtivo) {
+    ledcWrite(BUZZER_PIN, 128);
+    buzzerAtivo = true;
+    Serial.println("BUZZER ON");
+  }
+}
+
+void desligarBuzzer() {
+  if (buzzerAtivo) {
+    ledcWrite(BUZZER_PIN, 0);
+    buzzerAtivo = false;
+    Serial.println("BUZZER OFF");
+  }
+}
+
+void atualizarBuzzer() {
+  bool alarmeClima = (ultimoRecebimentoClima != 0 && estadoClima() != "CLIMA OK");
+  bool alarmeIrriga = (ultimoRecebimentoIrriga != 0 && estadoIrriga() != "SOLO OK");
+
+  if (alarmeClima || alarmeIrriga) ligarBuzzer();
+  else desligarBuzzer();
+}
+
+
+// COMUNICAÇÃO LORA
+void enviarLoRa(String comando) {
+  if (!loraOK) {
+    Serial.print("LoRa indisponivel - comando nao enviado: ");
+    Serial.println(comando);
+    enviarParaNextion("tStatusClima.txt=\"LoRa indisponivel\"");
+    enviarParaNextion("tStatusClima.pco=63488");
+    enviarParaNextion("tStatusIrriga.txt=\"LoRa indisponivel\"");
+    enviarParaNextion("tStatusIrriga.pco=63488");
+    return;
+  }
+  Serial.print("Enviado LoRa: ");
+  Serial.println(comando);
+  LoRa.beginPacket();
+  LoRa.print(comando);
+  LoRa.endPacket();
+}
+
+// DISPLAY NEXTION - PÁGINA CLIMA
+void atualizarDisplayClima() {
+  enviarParaNextion("tTemp.txt=\"" + String(temperatura, 1) + " C\"");                          //Envia para os lugares corretos no nextion devido à nomenclatura atribuída aos elementos na programação no nextion editor
+  enviarParaNextion("tHumidadeR.txt=\"" + String(humidadeR, 1) + " %\"");
+  enviarParaNextion("tPressao.txt=\"" + String(pressao, 0) + " Pa\"");
+  enviarParaNextion("tVPD.txt=\"" + String(vpd, 2) + " kPa\"");
+
+  if (fanEstado == 1) {
+    enviarParaNextion("tFan.txt=\"ON\"");                                                        //Atualiza estado do atuador e  cor do texto
+    enviarParaNextion("tFan.pco=5653");
+  } else {
+    enviarParaNextion("tFan.txt=\"OFF\"");
+    enviarParaNextion("tFan.pco=63488");
+  }
+
+  if (modoClimaEstado == 1) {
+    enviarParaNextion("btAUTOClima.txt=\"MANUAL\"");
+    enviarParaNextion("btAUTOClima.pco=63488");
+  } else {
+    enviarParaNextion("btAUTOClima.txt=\"AUTO\"");
+    enviarParaNextion("btAUTOClima.pco=5653");
+  }
+  atualizarStatusClima();
+}
+
+// DISPLAY NEXTION - PÁGINA IRRIGAÇÃO
+void atualizarDisplayIrriga() {
+  enviarParaNextion("tHumidade.txt=\"" + String(humidadeSolo) + "%\"");
+  enviarParaNextion("pHumidade.val=" + String(humidadeSolo));
+  enviarParaNextion("tBruto.txt=\"" + String(valorBrutoSolo) + "\"");
+
+  if (bombaEstado == 1) {
+    enviarParaNextion("tBomba.txt=\"ON\"");
+    enviarParaNextion("tBomba.pco=5653");
+  } else {
+    enviarParaNextion("tBomba.txt=\"OFF\"");
+    enviarParaNextion("tBomba.pco=63488");
+  }
+
+  if (modoIrrigaEstado == 1) {
+    enviarParaNextion("btAUTOIrriga.txt=\"MANUAL\"");
+    enviarParaNextion("btAUTOIrriga.pco=63488");
+  } else {
+    enviarParaNextion("btAUTOIrriga.txt=\"AUTO\"");
+    enviarParaNextion("btAUTOIrriga.pco=5653");
+  }
+  atualizarStatusIrriga();
+}
+
+// DISPLAY NEXTION - PÁGINA DE SETPOINTS
+void atualizarPaginaSetpoints() {                                                        //Atualização dos valores definidos
+  enviarParaNextion("tSetLigar.txt=\"" + String(tempLigar, 1) + "\"");
+  enviarParaNextion("tSetDesligar.txt=\"" + String(tempDesligar, 1) + "\"");
+  enviarParaNextion("tSetHumROn.txt=\"" + String(humRMax, 0) + "\"");
+  enviarParaNextion("tSetHumROff.txt=\"" + String(humRMin, 0) + "\"");
+  enviarParaNextion("tSetHumOn.txt=\"" + String(humSoloDesligar) + "\"");
+  enviarParaNextion("tSetHumOff.txt=\"" + String(humSoloLigar) + "\"");
+}
+
+
+// PROCESSAR NEXTION
+void processarComandoNextion(String cmd) {
+  cmd.trim();                                                                           //Assegura que não inclui lixo
+  Serial.print("CMD FILTRADO = [");
+  Serial.print(cmd);
+  Serial.println("]");
+
+  if (millis() - ultimoToque < DEBOUNCE_NEXTION) {                                     //Assegura o tempo mínimo entre comandos
+    Serial.println("Ignorado por debounce");
+    return;
+  }
+  ultimoToque = millis();
+
+  // CLIMA
+  if (cmd.indexOf("FAN_ON") >= 0) {
+    enviarLoRa("FAN_ON");
+    enviarParaNextion("tStatusClima.txt=\"FAN ON enviado\"");
+  }
+  else if (cmd.indexOf("FAN_OFF") >= 0) {
+    enviarLoRa("FAN_OFF");
+    enviarParaNextion("tStatusClima.txt=\"FAN OFF enviado\"");
+  }
+  else if (cmd.indexOf("MODO_AUTO_CLIMA") >= 0) {
+    enviarLoRa("MODO_AUTO_CLIMA");
+    enviarParaNextion("tStatusClima.txt=\"AUTO enviado\"");
+  }
+
+  // IRRIGAÇÃO
+  else if (cmd.indexOf("BOMBA_ON") >= 0) {
+    enviarLoRa("BOMBA_ON");
+    enviarParaNextion("tStatusIrriga.txt=\"BOMBA ON enviado\"");
+  }
+  else if (cmd.indexOf("BOMBA_OFF") >= 0) {
+    enviarLoRa("BOMBA_OFF");
+    enviarParaNextion("tStatusIrriga.txt=\"BOMBA OFF enviado\"");
+  }
+  else if (cmd.indexOf("MODO_AUTO_IRRIGA") >= 0) {
+    enviarLoRa("MODO_AUTO_IRRIGA");
+    enviarParaNextion("tStatusIrriga.txt=\"AUTO enviado\"");
+  }
+  else if (cmd.indexOf("MODO_AUTO") >= 0) {
+    enviarLoRa("MODO_AUTO");
+    enviarParaNextion("tStatusClima.txt=\"AUTO enviado\"");
+    enviarParaNextion("tStatusIrriga.txt=\"AUTO enviado\"");
+  }
+
+  // Setpoints
+  // temperatura 
+  else if (cmd.indexOf("INC_TEMP_ON") >= 0) {                                              //Processa os incrementos do display
+    tempLigar += 0.5;                                                                       //Botões + e - do limite superior do inetervalo de setpoints
+    if (tempLigar > 40.0) tempLigar = 40.0;
+    if (tempLigar <= tempDesligar) tempLigar = tempDesligar + 0.5;                         //Assegura lógica de valores
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  else if (cmd.indexOf("DEC_TEMP_ON") >= 0) {                                               
+    tempLigar -= 0.5;
+    if (tempLigar < 5.0) tempLigar = 5.0;
+    if (tempLigar <= tempDesligar) tempLigar = tempDesligar + 0.5;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  else if (cmd.indexOf("INC_TEMP_OFF") >= 0) {                                              //Botões + e - do limite inferior do inetervalo de setpoints
+    tempDesligar += 0.5;
+    if (tempDesligar > 39.5) tempDesligar = 39.5;
+    if (tempDesligar >= tempLigar) tempDesligar = tempLigar - 0.5;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  else if (cmd.indexOf("DEC_TEMP_OFF") >= 0) {
+    tempDesligar -= 0.5;
+    if (tempDesligar < 5.0) tempDesligar = 5.0;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  // Humidade relativa
+  else if (cmd.indexOf("INC_HUMR_ON") >= 0) {                                             //Botões + e - do limite superior do inetervalo de setpoints
+    humRMax += 5;
+    if (humRMax > 100) humRMax = 100;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  else if (cmd.indexOf("DEC_HUMR_ON") >= 0) {
+    humRMax -= 5;
+    if (humRMax < 5) humRMax = 5;
+    if (humRMax <= humRMin) humRMax = humRMin + 5;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  else if (cmd.indexOf("INC_HUMR_OFF") >= 0) {                                          //Botões + e - do limite Inferior do inetervalo de setpoints
+    humRMin += 5;
+    if (humRMin > 95) humRMin = 95;
+    if (humRMin >= humRMax) humRMin = humRMax - 5;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  else if (cmd.indexOf("DEC_HUMR_OFF") >= 0) {
+    humRMin -= 5;
+    if (humRMin < 0) humRMin = 0;
+    atualizarPaginaSetpoints();
+    atualizarStatusClima();
+  }
+
+  // Irrigação
+  //Humidade do solo
+  else if (cmd.indexOf("INC_HUM_ON") >= 0) {                                                          //Botões + e - do limite superior do inetervalo de setpoints
+    humSoloDesligar += 5;
+    if (humSoloDesligar > 100) humSoloDesligar = 100;
+    atualizarPaginaSetpoints();
+    atualizarStatusIrriga();
+  }
+  else if (cmd.indexOf("DEC_HUM_ON") >= 0) {
+    humSoloDesligar -= 5;
+    if (humSoloDesligar < 5) humSoloDesligar = 5;
+    if (humSoloDesligar <= humSoloLigar) humSoloDesligar = humSoloLigar + 5;
+    atualizarPaginaSetpoints();
+    atualizarStatusIrriga();
+  }
+
+  else if (cmd.indexOf("INC_HUM_OFF") >= 0) {                                                       //Botões + e - do limite Inferior do inetervalo de setpoints
+    humSoloLigar += 5;
+    if (humSoloLigar > 95) humSoloLigar = 95;
+    if (humSoloLigar >= humSoloDesligar) humSoloLigar = humSoloDesligar - 5;
+    atualizarPaginaSetpoints();
+    atualizarStatusIrriga();
+  }
+  else if (cmd.indexOf("DEC_HUM_OFF") >= 0) {
+    humSoloLigar -= 5;
+    if (humSoloLigar < 0) humSoloLigar = 0;
+    atualizarPaginaSetpoints();
+    atualizarStatusIrriga();
+  }
+
+  // Botão GUARDAR
+  else if (cmd.indexOf("GUARDAR_SETPOINTS") >= 0) {                                                         //Processamento da atualização dos setpoints e do seu envio para o ESP1
+    if (tempLigar > tempDesligar && humRMin < humRMax && humSoloLigar < humSoloDesligar) {
+      String cmdClima = "SET_TEMP:";
+      cmdClima += String(tempLigar, 1);
+      cmdClima += ",";
+      cmdClima += String(tempDesligar, 1);
+      cmdClima += ",";
+      cmdClima += String(humRMin, 0);
+      cmdClima += ",";
+      cmdClima += String(humRMax, 0);
+
+      String cmdIrriga = "SET_SOIL:";
+      cmdIrriga += String(humSoloLigar);
+      cmdIrriga += ",";
+      cmdIrriga += String(humSoloDesligar);
+
+      Serial.print("A ENVIAR SETPOINTS CLIMA: ");
+      Serial.println(cmdClima);
+      enviarLoRa(cmdClima);
+      delay(80);
+      Serial.print("A ENVIAR SETPOINTS IRRIGA: ");
+      Serial.println(cmdIrriga);
+      enviarLoRa(cmdIrriga);
+      enviarParaNextion("tStatusClima.txt=\"Setpoints enviados\"");
+      enviarParaNextion("tStatusIrriga.txt=\"Setpoints enviados\"");
+    }
+  }
+
+  else {
+    Serial.print("COMANDO DESCONHECIDO: ");
+    Serial.println(cmd);
+  }
+  atualizarBuzzer();
+}
+
+// INTERPRETA COMANDOS recebidos ENVIADOS PELO NEXTION
+void lerNextion() {
+  while (NextionSerial.available()) {
+    char c = NextionSerial.read();                                                         //Assegura que não aceita lixo
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') ||
+        c == '_') {
+      bufferNextion += c;
+    }
+ 
+    if (bufferNextion.indexOf("FAN_ON") >= 0) {
+      bufferNextion = ""; 
+      processarComandoNextion("FAN_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("FAN_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("FAN_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("BOMBA_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("BOMBA_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("BOMBA_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("BOMBA_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("MODO_AUTO_CLIMA") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("MODO_AUTO_CLIMA");
+      return;
+    }
+
+    if (bufferNextion.indexOf("MODO_AUTO_IRRIGA") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("MODO_AUTO_IRRIGA");
+      return;
+    }
+
+    if (bufferNextion.indexOf("MODO_AUTO") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("MODO_AUTO");
+      return;
+    }
+
+    if (bufferNextion.indexOf("INC_TEMP_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_TEMP_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("DEC_TEMP_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_TEMP_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("INC_TEMP_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_TEMP_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("DEC_TEMP_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_TEMP_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("INC_HUMR_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_HUMR_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("DEC_HUMR_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_HUMR_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("INC_HUMR_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_HUMR_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("DEC_HUMR_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_HUMR_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("INC_HUM_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_HUM_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("DEC_HUM_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_HUM_ON");
+      return;
+    }
+
+    if (bufferNextion.indexOf("INC_HUM_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_HUM_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("DEC_HUM_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_HUM_OFF");
+      return;
+    }
+
+    if (bufferNextion.indexOf("GUARDAR_SETPOINTS") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("GUARDAR_SETPOINTS");
+      return;
+    }
+
+    if (bufferNextion.length() > 50) {
+      bufferNextion = "";
+    }
+  }
+}
+
+
+// PROCESSAR PACOTES RECEBIDOS POR LORA
+void processarPacoteClima(String dados) {
+  int p1 = dados.indexOf(',');
+  int p2 = dados.indexOf(',', p1 + 1);
+  int p3 = dados.indexOf(',', p2 + 1);
+  int p4 = dados.indexOf(',', p3 + 1);
+  int p5 = dados.indexOf(',', p4 + 1);
+  int p6 = dados.indexOf(',', p5 + 1);
+  int p7 = dados.indexOf(',', p6 + 1);
+  int p8 = dados.indexOf(',', p7 + 1);
+  int p9 = dados.indexOf(',', p8 + 1);
+  int p10 = dados.indexOf(',', p9 + 1);
+
+  if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0 && p5 > 0 &&
+      p6 > 0 && p7 > 0 && p8 > 0 && p9 > 0 && p10 > 0) {
+
+    temperatura = dados.substring(6, p1).toFloat();                                             //Extração correta dos valores e dados dos pacotes
+    pressao = dados.substring(p1 + 1, p2).toFloat();
+    humidadeR = dados.substring(p2 + 1, p3).toFloat();
+    fanEstado = dados.substring(p3 + 1, p4).toInt();
+    modoClimaEstado = dados.substring(p4 + 1, p5).toInt();
+    tempLigar = dados.substring(p5 + 1, p6).toFloat();
+    tempDesligar = dados.substring(p6 + 1, p7).toFloat();
+    humRMin = dados.substring(p7 + 1, p8).toFloat();
+    humRMax = dados.substring(p8 + 1, p9).toFloat();
+    vpd = dados.substring(p9 + 1, p10).toFloat();
+    sensorClimaOK = dados.substring(p10 + 1).toInt();
+
+    ultimoRecebimentoClima = millis();
+
+    atualizarDisplayClima();
+    atualizarPaginaSetpoints();
+    atualizarBuzzer();
+    Serial.print("CLIMA recebido: ");
+    Serial.println(dados);
+  }
+}
+
+void processarPacoteIrriga(String dados) {
+  int p1 = dados.indexOf(',');
+  int p2 = dados.indexOf(',', p1 + 1);
+  int p3 = dados.indexOf(',', p2 + 1);
+  int p4 = dados.indexOf(',', p3 + 1);
+  int p5 = dados.indexOf(',', p4 + 1);
+  int p6 = dados.indexOf(',', p5 + 1);
+
+  if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0 && p5 > 0 && p6 > 0) {
+    humidadeSolo = dados.substring(7, p1).toInt();
+    valorBrutoSolo = dados.substring(p1 + 1, p2).toInt();
+    bombaEstado = dados.substring(p2 + 1, p3).toInt();
+    modoIrrigaEstado = dados.substring(p3 + 1, p4).toInt();
+    humSoloLigar = dados.substring(p4 + 1, p5).toInt();
+    humSoloDesligar = dados.substring(p5 + 1, p6).toInt();
+    sensorSoloOK = dados.substring(p6 + 1).toInt();
+    
+    ultimoRecebimentoIrriga = millis();
+
+    atualizarDisplayIrriga();
+    atualizarPaginaSetpoints();
+    atualizarBuzzer();
+    Serial.print("IRRIGA recebido: ");
+    Serial.println(dados);
+  }
+}
+
+
+// SETUP
+void setup() {
+  Serial.begin(115200);                                                           //Baud rate urilizado para a comunicação
+  delay(500);
+
+  NextionSerial.begin(9600, SERIAL_8N1, 14, 13);                                   //Baud rate utilizado no display nextion
+  delay(500);
+
+  ledcAttach(BUZZER_PIN, BUZZER_FREQ, BUZZER_RES);                                //Inicialização do alerta sonoro
+  ledcWrite(BUZZER_PIN, 0);
+
+  SPI.begin(5, 19, 27, 18);                                                       //Inicialização dos pinos da comunicação LoRa
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+ if (LoRa.begin(868E6)) {
+  loraOK = true;
+  Serial.println("LoRa OK");
+} else {
+  loraOK = false;
+  Serial.println("LoRa falhou - Nextion continua ativo");
+  enviarParaNextion("tStatusClima.txt=\"LoRa indisponivel\"");
+  enviarParaNextion("tStatusClima.pco=63488");
+  enviarParaNextion("tStatusIrriga.txt=\"LoRa indisponivel\"");
+  enviarParaNextion("tStatusIrriga.pco=63488");
+}
+
+  Serial.println("LoRa OK");
+
+  delay(300);
+  enviarParaNextion("page Clima");
+  delay(200);
+
+  atualizarPaginaSetpoints();
+  atualizarStatusClima();
+  atualizarStatusIrriga();
+
+  Serial.println("Nextion OK");
+}
+
+
+
+// LOOP
+void loop() {
+  lerNextion();
+
+  if (loraOK) {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String dados = "";
+    while (LoRa.available()) {
+      dados += (char)LoRa.read();
+    }
+    Serial.print("LoRa recebido: ");
+    Serial.println(dados);
+
+    lerNextion();
+    if (dados.startsWith("CLIMA:")) {
+      processarPacoteClima(dados);
+      lerNextion();
+    }
+
+    else if (dados.startsWith("IRRIGA:")) {
+      processarPacoteIrriga(dados);
+      lerNextion();
+    }
+  }
+}
+
+  
+    lerNextion();
+    if (dados.startsWith("CLIMA:")) {
+      processarPacoteClima(dados);
+      lerNextion();
+    }
+    else if (dados.startsWith("IRRIGA:")) {
+      processarPacoteIrriga(dados);
+      lerNextion();
+    }
+  }
+
+  if (loraOK && millis() - ultimoEnvioRequest > 35000) {
+    ultimoEnvioRequest = millis();
+    enviarLoRa("REQUEST_DATA");
+    Serial.println("REQUEST_DATA enviado via LoRa");
+  }
+
+  if (ultimoRecebimentoClima != 0 &&
+      millis() - ultimoRecebimentoClima > 120000) {
+    enviarParaNextion("tStatusClima.txt=\"SINAL PERDIDO!\"");
+    enviarParaNextion("tStatusClima.pco=63488");
+  }
+
+  if (ultimoRecebimentoIrriga != 0 &&
+      millis() - ultimoRecebimentoIrriga > 120000) {
+    enviarParaNextion("tStatusIrriga.txt=\"SINAL PERDIDO!\"");
+    enviarParaNextion("tStatusIrriga.pco=63488");
+  }
+
+  atualizarBuzzer();
+
+  delay(5);
+}
 
