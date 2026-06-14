@@ -1,1 +1,382 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <HardwareSerial.h>
+
+//Defenição dos pinos, inicialização de variaveis
+#define LORA_SS   18
+#define LORA_RST  23
+#define LORA_DIO0 26
+HardwareSerial NextionSerial(1);
+#define BUZZER_PIN 2
+#define BUZZER_FREQ 4000
+#define BUZZER_RES  8
+float lux = 0;
+float ppfd = 0;
+int percentLed = 0;
+int ledEstado = 0;
+int modoEstado = 0;
+int sensorOK = 0;
+float ppfdMin = 200.0;
+float ppfdMax = 300.0;
+const float PPFD_AVISO_BAIXO = 100.0;
+const float PPFD_AVISO_ALTO  = 500.0;
+bool buzzerAtivo = false;
+bool loraOK = false;
+unsigned long ultimoRecebimento = 0;
+unsigned long ultimoEnvioRequest = 0;
+String bufferNextion = "";
+unsigned long ultimoToque = 0;
+const unsigned long DEBOUNCE_NEXTION = 80;
+
+//NEXTION
+void enviarParaNextion(String comando) {
+  NextionSerial.print(comando);
+  NextionSerial.write(0xFF);
+  NextionSerial.write(0xFF);
+  NextionSerial.write(0xFF);
+}
+
+//BUZZER
+void ligarBuzzer() {
+  if (!buzzerAtivo) {
+    ledcWrite(BUZZER_PIN, 128);
+    buzzerAtivo = true;
+    Serial.println("BUZZER ON");
+  }
+}
+
+void desligarBuzzer() {
+  if (buzzerAtivo) {
+    ledcWrite(BUZZER_PIN, 0);
+    buzzerAtivo = false;
+    Serial.println("BUZZER OFF");
+  }
+}
+
+//ESTADO
+String estadoIluminacao() {
+  if (!loraOK) return "LORA INDISPONIVEL";
+  if (ultimoRecebimento == 0) return "A AGUARDAR LUZ";
+  if (millis() - ultimoRecebimento > 120000) return "SINAL PERDIDO!";
+  if (sensorOK == 0) return "ERRO SENSOR";
+  if (ppfd < PPFD_AVISO_BAIXO) return "LUZ MUITO BAIXA";
+  if (ppfd > PPFD_AVISO_ALTO)  return "LUZ MUITO ALTA";
+  if (ppfd < ppfdMin) return "ABAIXO IDEAL";
+  if (ppfd > ppfdMax) return "ACIMA IDEAL";
+  return "LUZ OK";
+}
+
+void atualizarStatusIlum() {
+  String estado = estadoIluminacao();
+  enviarParaNextion("tStatusIlum.txt=\"" + estado + "\"");
+  if (estado == "LUZ OK") {
+    enviarParaNextion("tStatusIlum.pco=5653");
+  } else if (estado == "A AGUARDAR LUZ") {
+    enviarParaNextion("tStatusIlum.pco=65535");
+  } else {
+    enviarParaNextion("tStatusIlum.pco=63488");
+  }
+}
+
+void atualizarBuzzer() {
+  String estado = estadoIluminacao();
+  if (estado == "ERRO SENSOR" ||
+      estado == "SINAL PERDIDO!" ||
+      estado == "LORA INDISPONIVEL" ||
+      estado == "LUZ MUITO BAIXA" ||
+      estado == "LUZ MUITO ALTA") {
+    ligarBuzzer();
+  } else {
+    desligarBuzzer();
+  }
+}
+
+//COMUNICAÇÃO LORA
+void enviarLoRa(String comando) {
+  if (!loraOK) {
+    Serial.print("LoRa indisponivel - comando nao enviado: ");
+    Serial.println(comando);
+    enviarParaNextion("tStatusIlum.txt=\"LoRa indisponivel\"");
+    enviarParaNextion("tStatusIlum.pco=63488");
+    atualizarBuzzer();
+    return;
+  }
+
+  Serial.print("Enviado LoRa: ");
+  Serial.println(comando);
+  LoRa.beginPacket();
+  LoRa.print(comando);
+  LoRa.endPacket();
+}
+
+// DISPLAY NEXTION - PÁGINA ILUMINAÇÃO
+void atualizarDisplay() {
+  enviarParaNextion("tLux.txt=\"" + String(lux, 0) + " Lux\"");
+  enviarParaNextion("tPPFD.txt=\"" + String(ppfd, 1) + " umol/m2/s\"");
+  enviarParaNextion("tPWMIlum.txt=\"" + String(percentLed) + "%\"");
+
+  if (ledEstado == 1) {
+    enviarParaNextion("tLed.txt=\"ON\"");
+    enviarParaNextion("tLed.pco=5653");
+    enviarParaNextion("btLedOn.pco=5653");
+    enviarParaNextion("btLedOff.pco=63488");
+  } else {
+    enviarParaNextion("tLed.txt=\"OFF\"");
+    enviarParaNextion("tLed.pco=63488");
+    enviarParaNextion("btLedOn.pco=63488");
+    enviarParaNextion("btLedOff.pco=5653");
+  }
+
+  if (modoEstado == 1) {
+    enviarParaNextion("btAUTOIlum.txt=\"MANUAL\"");
+    enviarParaNextion("btAUTOIlum.pco=63488");
+  } else {
+    enviarParaNextion("btAUTOIlum.txt=\"AUTO\"");
+    enviarParaNextion("btAUTOIlum.pco=5653");
+  }
+  atualizarStatusIlum();
+}
+
+// DISPLAY NEXTION - PÁGINA SETPOINTS
+void atualizarPaginaSetpoints() {
+  enviarParaNextion("tSetPPFDOn.txt=\"" + String(ppfdMax, 0) + "\"");
+  enviarParaNextion("tSetPPFDOff.txt=\"" + String(ppfdMin, 0) + "\"");
+}
+
+void processarComandoNextion(String cmd) {
+  cmd.trim();
+  Serial.print("CMD FILTRADO = [");
+  Serial.print(cmd);
+  Serial.println("]");
+
+  if (millis() - ultimoToque < DEBOUNCE_NEXTION) {
+    Serial.println("Ignorado por debounce");
+    return;
+  }
+  ultimoToque = millis();
+
+  if (cmd.indexOf("LED_ON") >= 0) {
+    enviarLoRa("LED_ON");
+    enviarParaNextion("tStatusIlum.txt=\"LED ON enviado\"");
+  }
+
+  else if (cmd.indexOf("LED_OFF") >= 0) {
+    enviarLoRa("LED_OFF");
+    enviarParaNextion("tStatusIlum.txt=\"LED OFF enviado\"");
+  }
+  else if (cmd.indexOf("MODO_AUTO_ILUM") >= 0) {
+    enviarLoRa("MODO_AUTO_ILUM");
+    enviarParaNextion("tStatusIlum.txt=\"AUTO enviado\"");
+  }
+  else if (cmd.indexOf("INC_PPFD_ON") >= 0) {
+    ppfdMax += 10;
+    if (ppfdMax > 1000) ppfdMax = 1000;
+    atualizarPaginaSetpoints();
+    atualizarStatusIlum();
+  }
+
+  else if (cmd.indexOf("DEC_PPFD_ON") >= 0) {
+    ppfdMax -= 10;
+    if (ppfdMax < 10) ppfdMax = 10;
+    if (ppfdMax <= ppfdMin) {
+      ppfdMax = ppfdMin + 10;
+    }
+    atualizarPaginaSetpoints();
+    atualizarStatusIlum();
+  }
+
+  else if (cmd.indexOf("INC_PPFD_OFF") >= 0) {
+    ppfdMin += 10;
+    if (ppfdMin > 990) ppfdMin = 990;
+    if (ppfdMin >= ppfdMax) {
+      ppfdMin = ppfdMax - 10;
+    }
+    atualizarPaginaSetpoints();
+    atualizarStatusIlum();
+  }
+
+  else if (cmd.indexOf("DEC_PPFD_OFF") >= 0) {
+    ppfdMin -= 10;
+    if (ppfdMin < 0) ppfdMin = 0;
+    atualizarPaginaSetpoints();
+    atualizarStatusIlum();
+  }
+  else if (cmd.indexOf("GUARDAR_SETPOINTS") >= 0) {
+    if (ppfdMin < ppfdMax) {
+      String cmdSet = "SET_ILUM:";
+      cmdSet += String(ppfdMin, 0);
+      cmdSet += ",";
+      cmdSet += String(ppfdMax, 0);
+
+      Serial.print("A ENVIAR SETPOINTS ILUM: ");
+      Serial.println(cmdSet);
+      enviarLoRa(cmdSet);
+      enviarParaNextion("tStatusIlum.txt=\"Setpoints enviados\"");
+    }
+  }
+  else {
+    Serial.print("COMANDO DESCONHECIDO: ");
+    Serial.println(cmd);
+    enviarParaNextion("tStatusIlum.txt=\"Comando desconhecido\"");
+  }
+  atualizarBuzzer();
+}
+
+//LER NEXTION
+void lerNextion() {
+  while (NextionSerial.available()) {
+    char c = NextionSerial.read();
+
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') ||
+        c == '_') {
+      bufferNextion += c;
+    }
+
+    if (bufferNextion.indexOf("LED_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("LED_ON");
+      return;
+    }
+    if (bufferNextion.indexOf("LED_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("LED_OFF");
+      return;
+    }
+    if (bufferNextion.indexOf("MODO_AUTO_ILUM") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("MODO_AUTO_ILUM");
+      return;
+    }
+    if (bufferNextion.indexOf("INC_PPFD_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_PPFD_ON");
+      return;
+    }
+    if (bufferNextion.indexOf("DEC_PPFD_ON") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_PPFD_ON");
+      return;
+    }
+    if (bufferNextion.indexOf("INC_PPFD_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("INC_PPFD_OFF");
+      return;
+    }
+    if (bufferNextion.indexOf("DEC_PPFD_OFF") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("DEC_PPFD_OFF");
+      return;
+    }
+    if (bufferNextion.indexOf("GUARDAR_SETPOINTS") >= 0) {
+      bufferNextion = "";
+      processarComandoNextion("GUARDAR_SETPOINTS");
+      return;
+    }
+    if (bufferNextion.length() > 40) {
+      bufferNextion = "";
+    }
+  }
+}
+
+// PROCESSAR PACOTE DE DADOS RECEBIDO LORA
+void processarPacoteIlum(String dados) {
+  int p1 = dados.indexOf(',');
+  int p2 = dados.indexOf(',', p1 + 1);
+  int p3 = dados.indexOf(',', p2 + 1);
+  int p4 = dados.indexOf(',', p3 + 1);
+  int p5 = dados.indexOf(',', p4 + 1);
+  int p6 = dados.indexOf(',', p5 + 1);
+  int p7 = dados.indexOf(',', p6 + 1);
+  int p8 = dados.indexOf(',', p7 + 1);
+
+  if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0 &&
+      p5 > 0 && p6 > 0 && p7 > 0 && p8 > 0) {
+
+    lux = dados.substring(5, p1).toFloat();            
+    ppfd = dados.substring(p1 + 1, p2).toFloat();
+    percentLed = dados.substring(p2 + 1, p3).toInt();
+    ledEstado = dados.substring(p3 + 1, p4).toInt();
+    modoEstado = dados.substring(p4 + 1, p5).toInt();
+    sensorOK = dados.substring(p5 + 1, p6).toInt();
+    ppfdMin = dados.substring(p6 + 1, p7).toFloat();
+    ppfdMax = dados.substring(p7 + 1, p8).toFloat();
+
+    ultimoRecebimento = millis();
+
+    atualizarDisplay();
+    atualizarPaginaSetpoints();
+    atualizarBuzzer();
+    Serial.print("ILUM recebido: ");
+    Serial.println(dados);
+  }
+}
+
+//SETUP
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  NextionSerial.begin(9600, SERIAL_8N1, 14, 13);
+  delay(500);
+  ledcAttach(BUZZER_PIN, BUZZER_FREQ, BUZZER_RES);
+  ledcWrite(BUZZER_PIN, 0);
+  SPI.begin(5, 19, 27, 18);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (LoRa.begin(868E6)) {
+    loraOK = true;
+    Serial.println("LoRa OK");
+  } else {
+    loraOK = false;
+    Serial.println("LoRa falhou - Nextion iluminacao continua ativo");
+  }
+  delay(300);
+  enviarParaNextion("page Iluminacao");
+  delay(200);
+  atualizarPaginaSetpoints();
+  atualizarStatusIlum();
+  atualizarBuzzer();
+  Serial.println("Nextion OK");
+}
+
+//LOOP
+void loop() {
+  lerNextion();
+  if (loraOK) {
+    int packetSize = LoRa.parsePacket();
+    if (packetSize) {
+      String dados = "";
+      while (LoRa.available()) {
+        dados += (char)LoRa.read();
+      }
+
+      Serial.print("LoRa recebido: ");
+      Serial.println(dados);
+      lerNextion();
+      if (dados.startsWith("ILUM:")) {
+        processarPacoteIlum(dados);
+        lerNextion();
+      }
+    }
+  }
+
+  if (loraOK && millis() - ultimoEnvioRequest > 35000) {
+    ultimoEnvioRequest = millis();
+    enviarLoRa("REQUEST_DATA");
+    Serial.println("REQUEST_DATA enviado via LoRa");
+  }
+  if (loraOK &&
+      ultimoRecebimento != 0 &&
+      millis() - ultimoRecebimento > 120000) {
+    enviarParaNextion("tStatusIlum.txt=\"SINAL PERDIDO!\"");
+    enviarParaNextion("tStatusIlum.pco=63488");
+    ligarBuzzer();
+  } else {
+    atualizarStatusIlum();
+    atualizarBuzzer();
+  }
+
+  delay(5);
+}
 
