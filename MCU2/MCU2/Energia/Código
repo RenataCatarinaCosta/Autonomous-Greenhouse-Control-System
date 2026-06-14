@@ -1,0 +1,132 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <HardwareSerial.h>
+
+// Defenição dos pinos e inicialização de variáveis
+#define LORA_SS   18
+#define LORA_RST  23
+#define LORA_DIO0 26
+HardwareSerial NextionSerial(1);
+float tensaoBateria = 0;
+int percBateria = 0;
+float correnteConsumo_mA = 0;
+float tensaoPainel = 0;
+float correntePainel_mA = 0;
+float potenciaPainel_W = 0;
+float tempEnergia = 0;
+bool loraOK = false;
+unsigned long ultimoRecebimentoEnergia = 0;
+
+//DISPLAY NEXTION
+void enviarParaNextion(String comando) {
+  NextionSerial.print(comando);
+  NextionSerial.write(0xFF);
+  NextionSerial.write(0xFF);
+  NextionSerial.write(0xFF);
+}
+
+void atualizarEnergiaNextion() {
+  enviarParaNextion("tBatV.txt=\"" + String(tensaoBateria, 2) + " V\"");
+  enviarParaNextion("jBat.val=" + String(percBateria));
+  enviarParaNextion("tConsumo.txt=\"" + String(correnteConsumo_mA, 1) + " mA\"");
+  enviarParaNextion("tPainelV.txt=\"" + String(tensaoPainel, 2) + " V\"");
+  enviarParaNextion("tPainelI.txt=\"" + String(correntePainel_mA, 1) + " mA\"");
+  enviarParaNextion("tPotencia.txt=\"" + String(potenciaPainel_W, 2) + " W\"");
+  enviarParaNextion("tTempBat.txt=\"" + String(tempEnergia, 1) + " C\"");
+
+  enviarParaNextion("tBatV.pco=65535");
+  enviarParaNextion("tConsumo.pco=65535");
+  enviarParaNextion("tPainelV.pco=65535");
+  enviarParaNextion("tPainelI.pco=65535");
+  enviarParaNextion("tPotencia.pco=65535");
+  enviarParaNextion("tTempBat.pco=65535");
+
+  if (tensaoBateria < 11.0 || tensaoBateria > 13.5) {
+    enviarParaNextion("tBatV.pco=63488");
+    enviarParaNextion("tStatusEnergia.txt=\"ALARME BATERIA\"");
+  }
+  else if (correnteConsumo_mA > 1000.0) {
+    enviarParaNextion("tConsumo.pco=63488");
+    enviarParaNextion("tStatusEnergia.txt=\"CONSUMO ALTO\"");
+  }
+  else if (tempEnergia < 5.0 || tempEnergia > 40.0) {
+    enviarParaNextion("tTempBat.pco=63488");
+    enviarParaNextion("tStatusEnergia.txt=\"TEMP FORA LIMITE\"");
+  }
+  else {
+    enviarParaNextion("tStatusEnergia.txt=\"ENERGIA OK\"");
+  }
+}
+
+//PROCESSAMENTO DO PACOTE LORA
+void processarEnergia(String dados) {
+  dados.trim();
+  if (!dados.startsWith("ENERGIA:")) return;
+
+  int p1 = dados.indexOf(',');
+  int p2 = dados.indexOf(',', p1 + 1);
+  int p3 = dados.indexOf(',', p2 + 1);
+  int p4 = dados.indexOf(',', p3 + 1);
+  int p5 = dados.indexOf(',', p4 + 1);
+  int p6 = dados.indexOf(',', p5 + 1);
+  int p7 = dados.indexOf(',', p6 + 1);
+
+  if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0 && p5 > 0 && p6 > 0 && p7 > 0) {
+    tensaoBateria = dados.substring(8, p1).toFloat();
+    percBateria = dados.substring(p1 + 1, p2).toInt();
+    correnteConsumo_mA = dados.substring(p2 + 1, p3).toFloat();
+    tensaoPainel = dados.substring(p3 + 1, p4).toFloat();
+    correntePainel_mA = dados.substring(p4 + 1, p5).toFloat();
+    potenciaPainel_W = dados.substring(p5 + 1, p6).toFloat();
+    tempEnergia = dados.substring(p6 + 1, p7).toFloat();
+
+    ultimoRecebimentoEnergia = millis();
+    Serial.print("Energia recebida: ");
+    Serial.println(dados);
+    atualizarEnergiaNextion();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  NextionSerial.begin(9600, SERIAL_8N1, 14, 13);
+  delay(500);
+  SPI.begin(5, 19, 27, 18);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+if (LoRa.begin(868E6)) {
+  loraOK = true;
+  Serial.println("LoRa OK");
+} else {
+  loraOK = false;
+  Serial.println("LoRa falhou - Nextion Energia continua ativo");
+}
+  delay(300);
+  enviarParaNextion("page Energia");
+  delay(200);
+  enviarParaNextion("tStatusEnergia.txt=\"A AGUARDAR ENERGIA\"");
+  Serial.println("ESP2 Energia pronto");
+}
+
+void loop() {
+ if (loraOK) {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String dados = "";
+    while (LoRa.available()) {
+      dados += (char)LoRa.read();
+    }
+    Serial.print("LoRa recebido: ");
+    Serial.println(dados);
+
+    processarEnergia(dados);
+  }
+}
+
+  if (ultimoRecebimentoEnergia != 0 &&
+      millis() - ultimoRecebimentoEnergia > 120000) {
+    enviarParaNextion("tStatusEnergia.txt=\"SINAL ENERGIA PERDIDO\"");
+  }
+  delay(5);
+}
